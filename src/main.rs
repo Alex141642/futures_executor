@@ -1,21 +1,27 @@
 use std::{
+    collections::VecDeque,
+    fmt::{write, Debug, Display},
     future::Future,
     pin::Pin,
-    sync::{
-        mpsc::{sync_channel, Receiver, SyncSender},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll, Wake, Waker},
     thread,
     time::Duration,
 };
 
 struct Executor {
-    ready_queue: Receiver<Arc<Task>>,
+    ready_queue: VecDeque<Arc<Task>>,
 }
 impl Executor {
-    fn run(&self) {
-        while let Ok(task) = self.ready_queue.recv() {
+    fn spawn(future: impl Future<Output = ()> + Send + 'static) {
+        let future = Box::pin(future);
+        let task = Arc::new(Task {
+            future: Mutex::new(Some(future)),
+        });
+        unsafe { EXECUTOR.ready_queue.push_back(task) };
+    }
+    fn run(&mut self) {
+        while let Some(task) = self.ready_queue.pop_front() {
             // Take the future, and if it has not yet completed (is still Some),
             // poll it in an attempt to complete it.
             let mut future_slot = task.future.lock().unwrap();
@@ -27,15 +33,23 @@ impl Executor {
                 // `Pin<Box<dyn Future<Output = T> + Send + 'static>>`.
                 // We can get a `Pin<&mut dyn Future + Send + 'static>`
                 // from it by calling the `Pin::as_mut` method.
-                if future.as_mut().poll(context).is_pending() {
-                    // We're not done processing the future, so put it
-                    // back in its task to be run again in the future.
-                    *future_slot = Some(future);
+                match future.as_mut().poll(context) {
+                    Poll::Pending => {
+                        // We're not done processing the future, so put it
+                        // back in its task to be run again in the future.
+                        *future_slot = Some(future);
+                        context.waker().wake_by_ref();
+                    }
+                    Poll::Ready(v) => {}
                 }
             }
         }
     }
 }
+
+static mut EXECUTOR: Executor = Executor {
+    ready_queue: VecDeque::new(),
+};
 
 struct Task {
     /// In-progress future that should be pushed to completion.
@@ -46,39 +60,19 @@ struct Task {
     /// so we need to use the `Mutex` to prove thread-safety. A production
     /// executor would not need this, and could use `UnsafeCell` instead.
     future: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
-
-    /// Handle to place the task itself back onto the task queue.
-    task_sender: SyncSender<Arc<Task>>,
 }
 impl Wake for Task {
     fn wake(self: Arc<Self>) {
-        self.task_sender.send(self.clone()).unwrap();
+        unsafe { EXECUTOR.ready_queue.push_back(self.clone()) };
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.clone().wake();
     }
 }
-
-/// `Spawner` spawns new futures onto the task channel.
-#[derive(Clone)]
-struct Spawner {
-    task_sender: SyncSender<Arc<Task>>,
-}
-impl Spawner {
-    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
-        let future = Box::pin(future);
-        let task = Arc::new(Task {
-            future: Mutex::new(Some(future)),
-            task_sender: self.task_sender.clone(),
-        });
-        self.task_sender.send(task).expect("too many tasks queued");
+impl Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task")
     }
-}
-
-fn new_executor_and_spawner() -> (Executor, Spawner) {
-    // Maximum number of tasks to allow queueing in the channel at once.
-    // This is just to make `sync_channel` happy, and wouldn't be present in
-    // a real executor.
-    const MAX_QUEUED_TASKS: usize = 10_000;
-    let (task_sender, ready_queue) = sync_channel(MAX_QUEUED_TASKS);
-    (Executor { ready_queue }, Spawner { task_sender })
 }
 
 /* Sleep */
@@ -154,15 +148,18 @@ async fn hello(i: u64) {
 }
 
 async fn world(i: u64) {
+    println!("waiting {i}");
     TimerFuture::new(Duration::from_secs(i)).await;
     println!("World {i}!");
 }
 
 fn main() {
-    let (executor, spawner) = new_executor_and_spawner();
-    spawner.spawn(hello(10));
-    spawner.spawn(hello(5));
-    spawner.spawn(hello(2));
-    spawner.spawn(hello(1));
-    executor.run();
+    Executor::spawn(hello(10));
+    Executor::spawn(hello(5));
+
+    Executor::spawn(hello(2));
+
+    Executor::spawn(hello(1));
+
+    unsafe { EXECUTOR.run() };
 }
